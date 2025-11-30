@@ -1,0 +1,442 @@
+"""
+CelebA-HQ 데이터 다운로드 및 EDA/샘플 시각화 
+
+- ZIP 압축 해제
+- split/class별 이미지 개수 요약
+- 랜덤 샘플 그리드 시각화
+- 이미지 해상도 / 종횡비 / 파일 크기 분포
+- 클래스별 색/밝기 통계
+- pHash 기반 중복 이미지 의심 그룹 탐지
+- 결과 CSV 저장
+
+"""
+
+import os
+import glob
+import random
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# Jupyter/Colab에서만 display 쓰고, 일반 환경에서는 print로 대체
+try:
+    from IPython.display import display
+    HAS_DISPLAY = True
+except ImportError:
+    HAS_DISPLAY = False
+
+# =========================
+# 기본 설정
+# =========================
+
+# CelebA-HQ가 위치한 BASE 경로 
+BASE_DIR = "/content/drive/MyDrive/CelebA-HQ/celeba_hq"
+
+# EDA를 수행할 split 목록
+SPLITS = ["train", "val"]  
+
+# 이미지 확장자
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+# EDA 결과 저장 폴더
+OUTDIR = os.path.join(BASE_DIR, "_eda_out")
+
+
+# =========================
+# 유틸 함수 모음
+# =========================
+
+def extract_zip(zip_path: str, extract_path: str):
+    """ZIP 파일을 지정한 경로로 압축 해제"""
+    import zipfile
+
+    os.makedirs(extract_path, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_path)
+    print(f"압축 해제 완료 → {extract_path}")
+
+
+def list_images(root: str):
+    """루트 폴더 아래의 모든 이미지 경로를 재귀적으로 수집"""
+    paths = []
+    for ext in IMG_EXT:
+        paths += glob.glob(os.path.join(root, f"**/*{ext}"), recursive=True)
+    return sorted(paths)
+
+
+def read_image_cv(p: str):
+    """이미지를 BGR(OpenCV)로 읽기"""
+    return cv2.imread(p, cv2.IMREAD_COLOR)
+
+
+def show_grid(sample_paths, title="samples", rows=3, cols=3):
+    """이미지 경로 리스트를 받아서 그리드로 시각화"""
+    n = min(len(sample_paths), rows * cols)
+    if n == 0:
+        print(f"[skip] no images for {title}")
+        return
+    plt.figure(figsize=(cols * 3.2, rows * 3.2))
+    for i, p in enumerate(sample_paths[:n]):
+        img = read_image_cv(p)
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        plt.subplot(rows, cols, i + 1)
+        plt.imshow(img)
+        plt.axis("off")
+        plt.title(os.path.basename(os.path.dirname(p)))
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# 1) 폴더 구조/파일 수 요약
+# =========================
+
+def summarize_class_counts(base_dir: str, splits):
+    rows = []
+    for sp in splits:
+        sp_dir = os.path.join(base_dir, sp)
+        if not os.path.isdir(sp_dir):
+            print(f"[warn] split not found: {sp_dir}")
+            continue
+        classes = [d for d in os.listdir(sp_dir)
+                   if os.path.isdir(os.path.join(sp_dir, d))]
+        for cls in classes:
+            cls_dir = os.path.join(sp_dir, cls)
+            files = [f for f in os.listdir(cls_dir)
+                     if f.lower().endswith(IMG_EXT)]
+            rows.append({"split": sp, "class": cls, "count": len(files)})
+
+    df_summary = pd.DataFrame(rows)
+    if df_summary.empty:
+        raise RuntimeError("summary가 비어 있음. BASE_DIR/SPLITS/폴더명을 확인하세요.")
+
+    df_summary = df_summary.sort_values(["split", "class"]).reset_index(drop=True)
+    print("### 클래스 분포")
+    if HAS_DISPLAY:
+        display(df_summary)
+    else:
+        print(df_summary)
+
+    # split별 막대 그래프
+    for sp in splits:
+        sub = df_summary[df_summary["split"] == sp]
+        if len(sub) == 0:
+            continue
+        plt.figure(figsize=(4.5, 3.5))
+        plt.bar(sub["class"], sub["count"])
+        plt.title(f"{sp} class counts")
+        plt.ylabel("images")
+        for i, v in enumerate(sub["count"]):
+            plt.text(i, v, str(v), ha='center', va='bottom', fontsize=9)
+        plt.show()
+
+    return df_summary
+
+
+# =========================
+# 2) 각 클래스 무작위 샘플 시각화
+# =========================
+
+def visualize_random_samples(base_dir: str, splits):
+    for sp in splits:
+        sp_dir = os.path.join(base_dir, sp)
+        if not os.path.isdir(sp_dir):
+            continue
+        for cls in sorted(os.listdir(sp_dir)):
+            cls_dir = os.path.join(sp_dir, cls)
+            if not os.path.isdir(cls_dir):
+                continue
+            all_imgs = list_images(cls_dir)
+            random.shuffle(all_imgs)
+            show_grid(all_imgs[:9], title=f"{sp}/{cls} samples")
+
+
+# =========================
+# 3) 이미지 무결성 & 해상도/종횡비/파일크기 분포
+# =========================
+
+def scan_images(base_dir: str, splits):
+    rows = []
+    for sp in splits:
+        sp_dir = os.path.join(base_dir, sp)
+        if not os.path.isdir(sp_dir):
+            continue
+        for cls in sorted(os.listdir(sp_dir)):
+            cls_dir = os.path.join(sp_dir, cls)
+            if not os.path.isdir(cls_dir):
+                continue
+            img_paths = list_images(cls_dir)
+            for p in tqdm(img_paths, desc=f"scan {sp}/{cls}"):
+                ok, w, h, ar, size_kb = False, -1, -1, np.nan, np.nan
+                img = read_image_cv(p)
+                if img is not None and img.size > 0:
+                    h, w = img.shape[:2]
+                    if h > 0 and w > 0:
+                        ok = True
+                        ar = w / h
+                try:
+                    size_kb = os.path.getsize(p) / 1024.0
+                except OSError:
+                    pass
+                rows.append({
+                    "split": sp,
+                    "cls": cls,
+                    "path": p,
+                    "ok": ok,
+                    "w": w,
+                    "h": h,
+                    "aspect": ar,
+                    "size_kb": size_kb
+                })
+
+    df_scan = pd.DataFrame(rows)
+    print("손상/읽기 실패 이미지 수:", (~df_scan["ok"]).sum())
+
+    # 해상도 Top-10
+    df_ok = df_scan[df_scan.ok].copy()
+    res_counts = (df_ok.groupby(["w", "h"])
+                  .size()
+                  .sort_values(ascending=False)
+                  .head(10))
+    print("해상도 Top-10\n", res_counts)
+
+    # 분포 시각화
+    if len(df_ok):
+        plt.figure(figsize=(5, 3))
+        plt.hist(df_ok["w"], bins=30)
+        plt.title("Width distribution")
+        plt.xlabel("width")
+        plt.ylabel("count")
+        plt.show()
+
+        plt.figure(figsize=(5, 3))
+        plt.hist(df_ok["h"], bins=30)
+        plt.title("Height distribution")
+        plt.xlabel("height")
+        plt.ylabel("count")
+        plt.show()
+
+        plt.figure(figsize=(5, 3))
+        plt.hist(df_ok["aspect"].dropna(), bins=30)
+        plt.title("Aspect ratio distribution")
+        plt.xlabel("w/h")
+        plt.ylabel("count")
+        plt.show()
+
+        plt.figure(figsize=(5, 3))
+        plt.hist(df_ok["size_kb"].dropna(), bins=30)
+        plt.title("File size (KB) distribution")
+        plt.xlabel("KB")
+        plt.ylabel("count")
+        plt.show()
+
+    return df_scan
+
+
+# =========================
+# 4) 밝기/채도/색상 표본 통계
+# =========================
+
+def sample_color_stats(paths, k=1000):
+    """경로 리스트에서 최대 k개 샘플 뽑아 색/밝기 통계 계산"""
+    if len(paths) == 0:
+        return None
+    paths = paths if len(paths) <= k else random.sample(paths, k)
+    bgr_means, sats, brights = [], [], []
+    for p in paths:
+        img = read_image_cv(p)
+        if img is None:
+            continue
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        H, S, V = cv2.split(hsv)
+        sats.append(S.mean())
+        brights.append(V.mean())
+        bgr_means.append(img.mean(axis=(0, 1)))  # B,G,R
+    if not bgr_means:
+        return None
+    bgr_means = np.array(bgr_means)
+    return {
+        "B_mean": float(bgr_means[:, 0].mean()),
+        "G_mean": float(bgr_means[:, 1].mean()),
+        "R_mean": float(bgr_means[:, 2].mean()),
+        "S_mean": float(np.mean(sats)),
+        "V_mean": float(np.mean(brights)),
+        "n_sample": len(paths)
+    }
+
+
+def compute_color_stats(df_scan: pd.DataFrame, df_summary: pd.DataFrame):
+    df_ok = df_scan[df_scan.ok].copy()
+    stats_rows = []
+    for sp in df_summary["split"].unique():
+        for cls in df_summary[df_summary.split == sp]["class"].unique():
+            paths = list(df_ok[(df_ok.split == sp) & (df_ok.cls == cls)].path)
+            s = sample_color_stats(paths, k=1000)
+            if s:
+                s.update({"split": sp, "class": cls})
+                stats_rows.append(s)
+
+    df_color = (pd.DataFrame(stats_rows)
+                .sort_values(["split", "class"])
+                .reset_index(drop=True))
+    print("### 채널/밝기/채도 표본 요약")
+    if HAS_DISPLAY:
+        display(df_color)
+    else:
+        print(df_color)
+
+    # 간단 시각화
+    if len(df_color):
+        for col in ["R_mean", "G_mean", "B_mean", "S_mean", "V_mean"]:
+            plt.figure(figsize=(6, 3))
+            xs = [f"{r['split']}-{r['class']}" for _, r in df_color.iterrows()]
+            ys = df_color[col].values
+            plt.bar(xs, ys)
+            plt.title(col)
+            plt.xticks(rotation=30)
+            plt.ylabel("mean")
+            plt.show()
+
+    return df_color
+
+
+# =========================
+# 5) 극단치(용량 기준 상/하위) 샘플 보기
+# =========================
+
+def show_extremes(df_ok: pd.DataFrame, cls: str, sp: str, key="size_kb", k=4):
+    sub = df_ok[(df_ok.cls == cls) & (df_ok.split == sp) & df_ok[key].notna()]
+    if len(sub) < 2:
+        print(f"[skip] not enough for extremes: {sp}/{cls}")
+        return
+    small = sub.nsmallest(k, key)
+    large = sub.nlargest(k, key)
+    sel = list(small.path.values) + list(large.path.values)
+    show_grid(sel, title=f"{sp}/{cls} {key} extremes")
+
+
+def visualize_extremes(df_scan: pd.DataFrame, df_summary: pd.DataFrame, key="size_kb", k=4):
+    df_ok = df_scan[df_scan.ok].copy()
+    for sp in df_summary["split"].unique():
+        for cls in df_summary[df_summary.split == sp]["class"].unique():
+            show_extremes(df_ok, cls, sp, key=key, k=k)
+
+
+# =========================
+# 6) pHash 기반 중복 의심 점검
+# =========================
+
+def detect_phash_duplicates(df_scan: pd.DataFrame, sample_limit=None):
+    """
+    pHash로 중복 의심 이미지 그룹 탐지
+    sample_limit: 너무 크면 느리니까, None이면 전체, 숫자면 그 개수만 샘플링
+    """
+    try:
+        from PIL import Image
+        import imagehash
+    except ImportError:
+        print("[warn] imagehash, Pillow가 설치되어 있지 않습니다. 중복 탐지를 건너뜁니다.")
+        return {}
+
+    def perceptual_hash(p):
+        try:
+            im = Image.open(p).convert("RGB")
+            return str(imagehash.phash(im))
+        except Exception:
+            return None
+
+    df_ok = df_scan[df_scan.ok].copy()
+    phash_paths = df_ok.path.tolist()
+    if sample_limit is not None and len(phash_paths) > sample_limit:
+        phash_paths = random.sample(phash_paths, sample_limit)
+
+    dup_map = defaultdict(list)
+    for p in tqdm(phash_paths, desc="pHash"):
+        h = perceptual_hash(p)
+        if h is not None:
+            dup_map[h].append(p)
+
+    possible_dups = {h: ps for h, ps in dup_map.items() if len(ps) > 1}
+    print("의심 중복 그룹 수:", len(possible_dups))
+
+    # 예시 몇 개만 출력
+    shown = 0
+    for h, ps in possible_dups.items():
+        print(f"\n[dup hash={h}] count={len(ps)}")
+        for p in ps[:5]:
+            print("  ", p)
+        shown += 1
+        if shown >= 5:
+            break
+
+    return possible_dups
+
+
+# =========================
+# 7) 전체 파이프라인 실행
+# =========================
+
+def run_eda_pipeline(
+    base_dir: str = BASE_DIR,
+    splits=SPLITS,
+    outdir: str = OUTDIR,
+    do_phash: bool = True,
+    phash_sample_limit: int | None = None,
+):
+    os.makedirs(outdir, exist_ok=True)
+
+    # 1) 클래스 카운트 요약
+    df_summary = summarize_class_counts(base_dir, splits)
+
+    # 2) 무작위 샘플 시각화
+    visualize_random_samples(base_dir, splits)
+
+    # 3) 이미지 스캔 (해상도/비율/파일 크기)
+    df_scan = scan_images(base_dir, splits)
+
+    # 4) 색/밝기 통계
+    df_color = compute_color_stats(df_scan, df_summary)
+
+    # 5) 극단치 샘플 시각화
+    visualize_extremes(df_scan, df_summary, key="size_kb", k=4)
+
+    # 6) pHash 중복 의심
+    if do_phash:
+        _ = detect_phash_duplicates(df_scan, sample_limit=phash_sample_limit)
+
+    # 7) CSV 저장
+    df_summary.to_csv(os.path.join(outdir, "class_counts.csv"), index=False)
+    df_scan.to_csv(os.path.join(outdir, "scan_images.csv"), index=False)
+    df_color.to_csv(os.path.join(outdir, "color_stats.csv"), index=False)
+    print("EDA 결과 저장:", outdir)
+
+
+# =========================
+# 메인 (Colab/로컬 공통)
+# =========================
+
+if __name__ == "__main__":
+    # --- Colab에서만 사용: 구글 드라이브 마운트 ---
+    # from google.colab import drive
+    # drive.mount("/content/drive")
+
+    # --- ZIP 압축 해제 ---
+    # zip_path = "/content/drive/MyDrive/CelebA-HQ.zip"
+    # extract_path = "/content/drive/MyDrive/CelebA-HQ"
+    # extract_zip(zip_path, extract_path)
+
+    # --- EDA 전체 파이프라인 실행 ---
+    run_eda_pipeline(
+        base_dir=BASE_DIR,
+        splits=SPLITS,
+        outdir=OUTDIR,
+        do_phash=True,          
+        phash_sample_limit=None 
+    )
