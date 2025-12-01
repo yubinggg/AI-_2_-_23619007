@@ -17,10 +17,19 @@ RESIZED_DST= f"{ROOT_DRIVE}/celeba_hq_binary_224"
 FAKES_ROOT = f"{ROOT_DRIVE}/fakes/stylegan2_celebahq" # 가짜 생성 원본 저장
 
 NETWORK = "https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-celebahq-256x256.pkl"
-PSI_MAIN = 0.7
-NOISE_MAIN = "const" 
 
-# seed 분할(누수 방지)
+# ===== Multi-style 설정 =====
+# fake: ψ=0.5 / 0.7 / 1.0 × noise={const, random}
+STYLE_CONFIGS = [
+    {"psi": 0.5, "noise": "const"},
+    {"psi": 0.5, "noise": "random"},
+    {"psi": 0.7, "noise": "const"},   # 기존 메인
+    {"psi": 0.7, "noise": "random"},
+    {"psi": 1.0, "noise": "const"},
+    {"psi": 1.0, "noise": "random"},
+]
+
+# seed 분할(누수 방지) – 각 스타일 모두 이 구간으로 나눔
 SEED_TRAIN = (1, 21000)
 SEED_VAL   = (21001, 25500)
 SEED_TEST  = (25501, 30000)
@@ -29,13 +38,11 @@ SEED_TEST  = (25501, 30000)
 SEED = 42
 random.seed(SEED)
 
-
 def safe_rmtree(p):
     assert p.startswith("/content/drive/"), f"Refusing to delete: {p}"
     for forbid in ["/", "/content", "/content/drive", "/content/drive/MyDrive"]:
         assert p != forbid, f"Refusing to delete root-like path: {p}"
     shutil.rmtree(p, ignore_errors=True)
-
 
 # 싹 지움(주의)
 for p in [DST, RESIZED_DST, FAKES_ROOT]:
@@ -55,8 +62,8 @@ if not os.path.isdir("/content/stylegan2-ada-pytorch"):
 %cd /content/stylegan2-ada-pytorch
 
 # ======================================
-# 3) Fake 생성 (메인셋 ψ=0.7, noise=const)
-#    A_main_psi0.7_noise-const/seed000001.png ... seed030000.png
+# 3) Fake 생성 (멀티 스타일)
+#    각 스타일 별로 1~30000 seed 생성
 # ======================================
 import subprocess, shlex
 
@@ -73,54 +80,93 @@ def gen_range(outdir, seed_start, seed_end, trunc, noise_mode, network):
     print(cmd)
     subprocess.run(shlex.split(cmd), check=True)
 
-A_DIR = f"{FAKES_ROOT}/A_main_psi{PSI_MAIN}_noise-{NOISE_MAIN}"
-gen_range(A_DIR, 1, 30000, PSI_MAIN, NOISE_MAIN, NETWORK)
+# 스타일별로 폴더/태그 설정 + 이미지 생성
+for cfg in STYLE_CONFIGS:
+    psi = cfg["psi"]
+    noise = cfg["noise"]
+    tag = f"psi{psi}_noise-{noise}"   # 예: psi0.7_noise-const
+    outdir = f"{FAKES_ROOT}/{tag}"
+    cfg["tag"] = tag
+    cfg["outdir"] = outdir
+    print(f"\n[GEN] style={tag}")
+    gen_range(outdir, 1, 30000, psi, noise, NETWORK)
 
 %cd /content
 
 # ======================================
-# 4) Fake → ImageFolder로 분배(Seed 구간 기준)
+# 4) Fake → ImageFolder로 분배(Seed 구간 + 스타일 혼합)
+#    - 각 스타일에 동일한 seed range를 적용
+#    - 파일명에 스타일 정보를 넣어 충돌 방지
 # ======================================
 def seed_from_name(name: str) -> int:
     m = re.search(r"seed(\d+)", name)
     return int(m.group(1)) if m else None
 
-def place_file(src_path, dst_dir):
+def place_file_with_rename(src_path, dst_dir, new_name):
     Path(dst_dir).mkdir(parents=True, exist_ok=True)
-    dst_path = os.path.join(dst_dir, os.path.basename(src_path))
+    dst_path = os.path.join(dst_dir, new_name)
     if not os.path.exists(dst_path):
         shutil.copy2(src_path, dst_path)
+    return dst_path
 
-fake_paths = sorted(glob.glob(f"{A_DIR}/seed*.png"))
-assert len(fake_paths) == 30000, f"expected 30000 fakes, got {len(fake_paths)}"
-
-for p in fake_paths:
-    s = seed_from_name(os.path.basename(p))
-    if s is None:
-        continue
-    if SEED_TRAIN[0] <= s <= SEED_TRAIN[1]:
-        place_file(p, f"{DST}/train/fake")
-    elif SEED_VAL[0] <= s <= SEED_VAL[1]:
-        place_file(p, f"{DST}/val/fake")
-    elif SEED_TEST[0] <= s <= SEED_TEST[1]:
-        place_file(p, f"{DST}/test/fake")
-
-# ======================================
-# 5) Real → ImageFolder로 분배(수량 매칭)
-#    train/val/test 각각 fake 개수와 동일 수량으로 real 구성
-# ======================================
 valid_ext = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-all_real = []
-for root, _, files in os.walk(SRC_REAL):
-    for f in files:
-        if Path(f).suffix.lower() in valid_ext:
-            all_real.append(os.path.join(root, f))
-if not all_real:
-    raise SystemExit(f"[ERR] No images found under {SRC_REAL}")
+fake_rows = []  # manifest용 fake 메타 정보
 
-random.shuffle(all_real)
+for cfg in STYLE_CONFIGS:
+    psi = cfg["psi"]
+    noise = cfg["noise"]
+    tag = cfg["tag"]
+    outdir = cfg["outdir"]
 
+    fake_paths = sorted(glob.glob(f"{outdir}/seed*.png"))
+    assert len(fake_paths) == 30000, f"[{tag}] expected 30000 fakes, got {len(fake_paths)}"
+
+    print(f"[DIST] style={tag}, files={len(fake_paths)}")
+
+    for p in fake_paths:
+        fname = os.path.basename(p)
+        seed = seed_from_name(fname)
+        if seed is None:
+            continue
+
+        # 어떤 split에 들어갈지 결정 (seed 기준)
+        if SEED_TRAIN[0] <= seed <= SEED_TRAIN[1]:
+            split = "train"
+        elif SEED_VAL[0] <= seed <= SEED_VAL[1]:
+            split = "val"
+        elif SEED_TEST[0] <= seed <= SEED_TEST[1]:
+            split = "test"
+        else:
+            continue
+
+        # 스타일 정보가 들어간 파일명으로 복사
+        new_fname = f"{tag}_seed{seed:06d}.png"
+        dst_dir = f"{DST}/{split}/fake"
+        dst_path = place_file_with_rename(p, dst_dir, new_fname)
+
+        # 해상도
+        w = h = None
+        try:
+            with Image.open(dst_path) as im:
+                w, h = im.size
+        except:
+            pass
+
+        fake_rows.append({
+            "split": split,
+            "label": 1,
+            "path": dst_path,
+            "fname": new_fname,
+            "seed": seed,
+            "psi": psi,
+            "noise": noise,
+            "network": "stylegan2-celebahq-256x256.pkl",
+            "variant": tag,  # 나중에 per-style 분석할 때 key로 사용
+            "resolution": f"{w}x{h}" if (w and h) else ""
+        })
+
+# split별 fake 개수 확인
 def count_dir_images(d):
     return len([
         f for f in glob.glob(os.path.join(d, "*"))
@@ -130,27 +176,76 @@ def count_dir_images(d):
 n_train_fake = count_dir_images(f"{DST}/train/fake")
 n_val_fake   = count_dir_images(f"{DST}/val/fake")
 n_test_fake  = count_dir_images(f"{DST}/test/fake")
-need_total   = n_train_fake + n_val_fake + n_test_fake
-assert len(all_real) >= need_total, \
-    f"Not enough real images: need {need_total}, have {len(all_real)}"
-
-# 분배
-def copy_many(src_list, dst_dir, k):
-    Path(dst_dir).mkdir(parents=True, exist_ok=True)
-    for p in src_list[:k]:
-        place_file(p, dst_dir)
-    return src_list[k:]
-
-pool = all_real[:]
-pool = copy_many(pool, f"{DST}/train/real", n_train_fake)
-pool = copy_many(pool, f"{DST}/val/real",   n_val_fake)
-pool = copy_many(pool, f"{DST}/test/real",  n_test_fake)
 
 print("[COUNT] fake:", {
     "train": n_train_fake,
     "val":   n_val_fake,
     "test":  n_test_fake
 })
+
+# ======================================
+# 5) Real → ImageFolder로 분배(수량 매칭)
+#    train/val/test 각각 fake 개수와 동일 수량으로 real 구성
+# ======================================
+all_real = []
+for root, _, files in os.walk(SRC_REAL):
+    for f in files:
+        if Path(f).suffix.lower() in valid_ext:
+            all_real.append(os.path.join(root, f))
+
+if not all_real:
+    raise SystemExit(f"[ERR] No images found under {SRC_REAL}")
+
+random.shuffle(all_real)
+
+need_total   = n_train_fake + n_val_fake + n_test_fake
+assert len(all_real) >= need_total, \
+    f"Not enough real images: need {need_total}, have {len(all_real)}"
+
+def copy_many_with_manifest(src_list, dst_dir, k, split, manifest_rows):
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    used = 0
+    for p in src_list:
+        if used >= k:
+            break
+        ext = Path(p).suffix.lower()
+        if ext not in valid_ext:
+            continue
+        fname = os.path.basename(p)
+        dst_path = place_file_with_rename(p, dst_dir, fname)
+
+        w = h = None
+        try:
+            with Image.open(dst_path) as im:
+                w, h = im.size
+        except:
+            pass
+
+        manifest_rows.append({
+            "split": split,
+            "label": 0,
+            "path": dst_path,
+            "fname": fname,
+            "seed": "",
+            "psi": "",
+            "noise": "",
+            "network": "",
+            "variant": "real",
+            "resolution": f"{w}x{h}" if (w and h) else ""
+        })
+        used += 1
+
+    # k개 사용 후 나머지 반환
+    remaining = src_list[used:]
+    return remaining
+
+manifest_rows = fake_rows[:]   # fake 메타 + real 메타 같이 쓸 리스트
+
+pool = all_real[:]
+pool = copy_many_with_manifest(pool, f"{DST}/train/real", n_train_fake, "train", manifest_rows)
+pool = copy_many_with_manifest(pool, f"{DST}/val/real",   n_val_fake,   "val",   manifest_rows)
+pool = copy_many_with_manifest(pool, f"{DST}/test/real",  n_test_fake,  "test",  manifest_rows)
+
 print("[COUNT] real:", {
     "train": count_dir_images(f"{DST}/train/real"),
     "val":   count_dir_images(f"{DST}/val/real"),
@@ -158,48 +253,13 @@ print("[COUNT] real:", {
 })
 
 # ======================================
-# 6) Manifest 생성 (메인셋)
+# 6) Manifest 생성 (멀티 스타일)
 #    컬럼: split,label(0/1),path,fname,seed,psi,noise,network,variant,resolution
 # ======================================
-rows = []
-
-def add_dir(split, label_name):
-    label = 1 if label_name == "fake" else 0
-    d = f"{DST}/{split}/{label_name}"
-    for fp in sorted(glob.glob(f"{d}/*")):
-        if Path(fp).suffix.lower() not in valid_ext:
-            continue
-        fname = os.path.basename(fp)
-        w = h = None
-        try:
-            with Image.open(fp) as im:
-                w, h = im.size
-        except:
-            pass
-        seed = None
-        if label == 1:
-            seed = seed_from_name(fname)
-        rows.append({
-            "split": split,
-            "label": label,
-            "path": fp,
-            "fname": fname,
-            "seed": seed if seed is not None else "",
-            "psi": PSI_MAIN if label == 1 else "",
-            "noise": NOISE_MAIN if label == 1 else "",
-            "network": "stylegan2-celebahq-256x256.pkl" if label == 1 else "",
-            "variant": "A_main_psi0.7_noise-const" if label == 1 else "",
-            "resolution": f"{w}x{h}" if (w and h) else ""
-        })
-
-for sp in ["train", "val", "test"]:
-    add_dir(sp, "real")
-    add_dir(sp, "fake")
-
 manifest_path = f"{DST}/meta"
 Path(manifest_path).mkdir(parents=True, exist_ok=True)
-FINAL_MANIFEST = f"{manifest_path}/dataset_manifest.csv"
-pd.DataFrame(rows).to_csv(FINAL_MANIFEST, index=False)
+FINAL_MANIFEST = f"{manifest_path}/dataset_manifest_multi_style.csv"
+pd.DataFrame(manifest_rows).to_csv(FINAL_MANIFEST, index=False)
 print("[OK] manifest:", FINAL_MANIFEST)
 
 # ======================================
@@ -212,9 +272,9 @@ def md5sum(p):
             m.update(chunk)
     return m.hexdigest()
 
-# 파일명 중복
 from collections import Counter
 
+# 파일명 중복
 names = []
 for sp in ["train", "val", "test"]:
     for lb in ["real", "fake"]:
@@ -246,3 +306,7 @@ df = pd.read_csv(FINAL_MANIFEST)
 print()
 print("[SUMMARY BY SPLIT/LABEL]")
 print(df.groupby(["split", "label"]).size().unstack(fill_value=0))
+
+print()
+print("[SUMMARY BY SPLIT/VARIANT]")
+print(df.groupby(["split", "variant"]).size().unstack(fill_value=0))
