@@ -4,7 +4,6 @@
 # - AMP 일관 적용, Grad-CAM은 target=fake(1) 고정
 # - 평가 변환 Resize((224,224))
 # - 패널 텍스트를 이미지 '아래'에 배치
-# - 새 경로: /content/drive/MyDrive/celeba_hq_binary_224_new (이미 224 리사이즈 완료)
 # ============================================
 
 !pip install -q opencv-python-headless==4.10.0.84 \
@@ -37,7 +36,7 @@ drive.mount('/content/drive')
 # -------------------------
 # 1) 경로 및 옵션 설정
 # -------------------------
-USE_LOCAL_COPY = False       # 이미 Drive에 224 데이터 있음 → 그대로 사용
+USE_LOCAL_COPY = False       # Drive에 있는 224 데이터 바로 사용
 MAX_WORKERS    = 4
 TARGET_SIDE    = 224
 
@@ -46,20 +45,20 @@ FRACTION_TRAIN = 1.0
 FRACTION_VAL   = 1.0
 FRACTION_TEST  = 1.0
 
-EPOCHS = 20
-LR = 1e-3
-WD = 1e-4
+EPOCHS   = 20
+LR       = 1e-3
+WD       = 1e-4
 patience = 5  # early stop
 
 ROOT_DRIVE = "/content/drive/MyDrive"
 
-# 새로 재구성한 224 데이터 경로
-SRC_DRIVE  = f"{ROOT_DRIVE}/celeba_hq_binary_224_new"       # 실제 이미지(이미 224x224)
-DST_DRIVE  = SRC_DRIVE                                      # 별도 리사이즈 없이 그대로 사용
-META_DRIVE = f"{ROOT_DRIVE}/celeba_hq_binary_224_new_meta"  # 메타/모델 저장
+# 🔹 multi-style 리사이즈 데이터 경로
+SRC_DRIVE  = f"{ROOT_DRIVE}/celeba_hq_binary_224_multi"       # 224x224 리사이즈 완료된 이미지
+DST_DRIVE  = SRC_DRIVE                                        # 별도 리사이즈 없이 그대로 사용
+META_DRIVE = f"{ROOT_DRIVE}/celeba_hq_binary_224_multi_meta"  # 메타/모델 저장
 
-# 로컬 복사 경로(이번에는 사용하지 않지만, 구조는 그대로 둠)
-SRC_LOCAL = "/content/celeba_hq_binary_224_new"
+# 로컬 복사 경로(원하면 나중에 USE_LOCAL_COPY=True로 변경해서 사용)
+SRC_LOCAL = "/content/celeba_hq_binary_224_multi"
 DST_LOCAL = SRC_LOCAL
 META_LOCAL= META_DRIVE
 
@@ -787,6 +786,79 @@ if clip_scores:
 else:
     print("[WARN] 유효한 CLIPScore가 없음")
 
+# ============================================
+# ResNet50 최종 Test Accuracy / AUC 계산
+# ============================================
 
+import numpy as np
+from sklearn.metrics import roc_curve, auc, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
 
-이 코드 그럼 깃허브에 정리하면 되는 거 맞아?
+# -------------------------
+# 1) 확률 수집 (P(fake))
+# -------------------------
+@torch.no_grad()
+def collect_logits_resnet(loader):
+    model.eval()
+    ys, ps = [], []
+    for xb, yb in loader:
+        xb = xb.to(DEVICE, non_blocking=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            prob = torch.softmax(model(xb), dim=1)[:, 1].cpu().numpy()  # P(fake)
+        ys.append(yb.numpy())
+        ps.append(prob)
+    return np.concatenate(ys), np.concatenate(ps)
+
+# -------------------------
+# 2) 레이블 예측
+# -------------------------
+@torch.no_grad()
+def collect_pred_resnet(loader):
+    model.eval()
+    all_y, all_hat = [], []
+    for xb, yb in loader:
+        xb = xb.to(DEVICE, non_blocking=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            logits = model(xb)
+        preds = logits.argmax(1).cpu().numpy()
+        all_y.append(yb.numpy())
+        all_hat.append(preds)
+    return np.concatenate(all_y), np.concatenate(all_hat)
+
+# -------------------------
+# 3) Test split 평가 실행
+# -------------------------
+y_true_prob, y_fake_prob = collect_logits_resnet(test_loader)
+fpr, tpr, _ = roc_curve(y_true_prob, y_fake_prob)
+auc_test = auc(fpr, tpr)
+
+y_true, y_pred = collect_pred_resnet(test_loader)
+acc_test = (y_true == y_pred).mean()
+
+# -------------------------
+# 4) Print Results
+# -------------------------
+print("=========== ResNet50 Test 성능 ===========")
+print(f"Test Accuracy : {acc_test:.4f}")
+print(f"Test AUC      : {auc_test:.4f}")
+print("\n[Classification Report]")
+print(classification_report(y_true, y_pred, target_names=['real(0)','fake(1)']))
+print("[Confusion Matrix]")
+print(confusion_matrix(y_true, y_pred))
+
+# -------------------------
+# 5) ROC 저장
+# -------------------------
+plt.figure()
+plt.plot(fpr, tpr, label=f"AUC={auc_test:.4f}")
+plt.plot([0,1],[0,1],'--')
+plt.legend()
+plt.title("ResNet50 ROC (test)")
+plt.xlabel("FPR")
+plt.ylabel("TPR")
+plt.savefig(f"{META}/roc_test_resnet50.png", bbox_inches="tight")
+plt.close()
+
+print(f"[OK] ROC 저장 완료: {META}/roc_test_resnet50.png")
