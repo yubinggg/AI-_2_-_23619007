@@ -1,0 +1,24 @@
+import os
+from PIL import Image
+from pathlib import Path
+import glob
+
+SRC = "/content/drive/MyDrive/celeba_hq_binary"
+DST = "/content/drive/MyDrive/celeba_hq_binary_224_multi"
+
+for split in ["train", "val", "test"]:
+    for cls in ["real", "fake"]:
+        src_dir = f"{SRC}/{split}/{cls}"
+        dst_dir = f"{DST}/{split}/{cls}"
+        Path(dst_dir).mkdir(parents=True, exist_ok=True)
+
+        img_paths = glob.glob(f"{src_dir}/*")
+        print(f"[{split}/{cls}] {len(img_paths)}개 리사이즈 중...")
+
+        for p in img_paths:
+            try:
+                img = Image.open(p).convert("RGB")
+                img = img.resize((224, 224))
+                img.save(f"{dst_dir}/{Path(p).name}")
+            except:
+                print(f"[WARN] 실패: {p}")
