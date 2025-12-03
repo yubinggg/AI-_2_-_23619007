@@ -62,38 +62,6 @@ if not os.path.isdir("/content/stylegan2-ada-pytorch"):
 %cd /content/stylegan2-ada-pytorch
 
 # ======================================
-# 3) Fake 생성 (멀티 스타일)
-#    각 스타일 별로 1~30000 seed 생성
-# ======================================
-import subprocess, shlex
-
-def gen_range(outdir, seed_start, seed_end, trunc, noise_mode, network):
-    os.makedirs(outdir, exist_ok=True)
-    cmd = f"""
-    python generate.py \
-      --outdir="{outdir}" \
-      --seeds={seed_start}-{seed_end} \
-      --trunc={trunc} \
-      --noise-mode={noise_mode} \
-      --network="{network}"
-    """
-    print(cmd)
-    subprocess.run(shlex.split(cmd), check=True)
-
-# 스타일별로 폴더/태그 설정 + 이미지 생성
-for cfg in STYLE_CONFIGS:
-    psi = cfg["psi"]
-    noise = cfg["noise"]
-    tag = f"psi{psi}_noise-{noise}"   # 예: psi0.7_noise-const
-    outdir = f"{FAKES_ROOT}/{tag}"
-    cfg["tag"] = tag
-    cfg["outdir"] = outdir
-    print(f"\n[GEN] style={tag}")
-    gen_range(outdir, 1, 30000, psi, noise, NETWORK)
-
-%cd /content
-
-# ======================================
 # 4) Fake → ImageFolder로 분배(Seed 구간 + 스타일 혼합)
 #    - 각 스타일에 동일한 seed range를 적용
 #    - 파일명에 스타일 정보를 넣어 충돌 방지
@@ -185,82 +153,120 @@ print("[COUNT] fake:", {
 
 # ======================================
 # 5) Real → ImageFolder로 분배(수량 매칭)
-#    train/val/test 각각 fake 개수와 동일 수량으로 real 구성
+#    - 스타일 개수(len(STYLE_CONFIGS))를 고려해서 real 개수를 줄여서 사용
+#    - CelebA-HQ 전체 30000장을 한 번씩만 사용
 # ======================================
-all_real = []
-for root, _, files in os.walk(SRC_REAL):
-    for f in files:
-        if Path(f).suffix.lower() in valid_ext:
-            all_real.append(os.path.join(root, f))
 
-if not all_real:
-    raise SystemExit(f"[ERR] No images found under {SRC_REAL}")
+# 혹시 fake가 0장일 때는 바로 경고
+if n_train_fake == 0 and n_val_fake == 0 and n_test_fake == 0:
+    print("[WARN] fake 이미지 개수가 0이야. 위에서 3)·4) 셀 실행 중 오류가 없었는지 먼저 확인해봐.")
+else:
+    # CelebA-HQ real 이미지 전체 수집
+    all_real = []
+    for root, _, files in os.walk(SRC_REAL):
+        for f in files:
+            if Path(f).suffix.lower() in valid_ext:
+                all_real.append(os.path.join(root, f))
 
-random.shuffle(all_real)
+    if not all_real:
+        raise SystemExit(f"[ERR] No real images found under {SRC_REAL}")
 
-need_total   = n_train_fake + n_val_fake + n_test_fake
-assert len(all_real) >= need_total, \
-    f"Not enough real images: need {need_total}, have {len(all_real)}"
+    print(f"[REAL] 총 real 이미지 수: {len(all_real)}")
+    random.shuffle(all_real)
 
-def copy_many_with_manifest(src_list, dst_dir, k, split, manifest_rows):
-    Path(dst_dir).mkdir(parents=True, exist_ok=True)
-    used = 0
-    for p in src_list:
-        if used >= k:
-            break
-        ext = Path(p).suffix.lower()
-        if ext not in valid_ext:
+    # 스타일 개수 (multi-style 비율 맞추기용)
+    N_STYLE = len(STYLE_CONFIGS)
+    print(f"[INFO] STYLE_CONFIGS 개수 (N_STYLE) = {N_STYLE}")
+
+    # fake 개수를 스타일 개수로 나눠서 real 개수 결정
+    #  → 스타일 6개 × 30000 fake = 180000이지만,
+    #    real은 그 1/6만 써서 최종적으로 30000장 수준만 사용
+    n_train_real = max(1, n_train_fake // N_STYLE)
+    n_val_real   = max(1, n_val_fake   // N_STYLE)
+    n_test_real  = max(1, n_test_fake  // N_STYLE)
+
+    need_total_real = n_train_real + n_val_real + n_test_real
+    assert len(all_real) >= need_total_real, \
+        f"Not enough REAL images: need {need_total_real}, have {len(all_real)}"
+
+    print("[TARGET REAL COUNT]", {
+        "train": n_train_real,
+        "val":   n_val_real,
+        "test":  n_test_real
+    })
+
+    def copy_many(src_list, dst_dir, k):
+        Path(dst_dir).mkdir(parents=True, exist_ok=True)
+        used = []
+        for p in src_list[:k]:
+            fname = os.path.basename(p)
+            dst_path = os.path.join(dst_dir, fname)
+            if not os.path.exists(dst_path):
+                shutil.copy2(p, dst_path)
+            used.append(p)
+        return src_list[k:], used
+
+    pool = all_real[:]
+
+    pool, used_train = copy_many(pool, f"{DST}/train/real", n_train_real)
+    pool, used_val   = copy_many(pool, f"{DST}/val/real",   n_val_real)
+    pool, used_test  = copy_many(pool, f"{DST}/test/real",  n_test_real)
+
+    print("[COUNT] real:", {
+        "train": count_dir_images(f"{DST}/train/real"),
+        "val":   count_dir_images(f"{DST}/val/real"),
+        "test":  count_dir_images(f"{DST}/test/real"),
+    })
+
+# ======================================
+# 6) Manifest 생성 (fake + real)
+#    컬럼: split,label(0/1),path,fname,seed,psi,noise,network,variant,resolution
+# ======================================
+rows = list(fake_rows)  # 이미 만들어 둔 fake 메타 복사
+
+# REAL 쪽 메타 추가
+for split in ["train", "val", "test"]:
+    real_dir = f"{DST}/{split}/real"
+    if not os.path.isdir(real_dir):
+        continue
+    for fp in sorted(glob.glob(f"{real_dir}/*")):
+        if Path(fp).suffix.lower() not in valid_ext:
             continue
-        fname = os.path.basename(p)
-        dst_path = place_file_with_rename(p, dst_dir, fname)
-
+        fname = os.path.basename(fp)
         w = h = None
         try:
-            with Image.open(dst_path) as im:
+            with Image.open(fp) as im:
                 w, h = im.size
         except:
             pass
 
-        manifest_rows.append({
+        rows.append({
             "split": split,
-            "label": 0,
-            "path": dst_path,
+            "label": 0,           # real = 0
+            "path": fp,
             "fname": fname,
-            "seed": "",
+            "seed": "",           # real에는 seed / psi / noise 없음
             "psi": "",
             "noise": "",
             "network": "",
-            "variant": "real",
+            "variant": "real",    # 나중에 구분용
             "resolution": f"{w}x{h}" if (w and h) else ""
         })
-        used += 1
 
-    # k개 사용 후 나머지 반환
-    remaining = src_list[used:]
-    return remaining
-
-manifest_rows = fake_rows[:]   # fake 메타 + real 메타 같이 쓸 리스트
-
-pool = all_real[:]
-pool = copy_many_with_manifest(pool, f"{DST}/train/real", n_train_fake, "train", manifest_rows)
-pool = copy_many_with_manifest(pool, f"{DST}/val/real",   n_val_fake,   "val",   manifest_rows)
-pool = copy_many_with_manifest(pool, f"{DST}/test/real",  n_test_fake,  "test",  manifest_rows)
-
-print("[COUNT] real:", {
-    "train": count_dir_images(f"{DST}/train/real"),
-    "val":   count_dir_images(f"{DST}/val/real"),
-    "test":  count_dir_images(f"{DST}/test/real"),
-})
-
-# ======================================
-# 6) Manifest 생성 (멀티 스타일)
-#    컬럼: split,label(0/1),path,fname,seed,psi,noise,network,variant,resolution
-# ======================================
+# manifest 저장
 manifest_path = f"{DST}/meta"
 Path(manifest_path).mkdir(parents=True, exist_ok=True)
-FINAL_MANIFEST = f"{manifest_path}/dataset_manifest_multi_style.csv"
-pd.DataFrame(manifest_rows).to_csv(FINAL_MANIFEST, index=False)
+FINAL_MANIFEST = f"{manifest_path}/dataset_manifest.csv"
+
+import pandas as pd
+pd.DataFrame(rows).to_csv(FINAL_MANIFEST, index=False)
 print("[OK] manifest:", FINAL_MANIFEST)
+
+print()
+print("[SUMMARY BY SPLIT/LABEL]")
+df = pd.read_csv(FINAL_MANIFEST)
+print(df.groupby(["split", "label"]).size().unstack(fill_value=0))
+
 
 # ======================================
 # 7) 무결성/중복 체크
@@ -278,7 +284,10 @@ from collections import Counter
 names = []
 for sp in ["train", "val", "test"]:
     for lb in ["real", "fake"]:
-        for f in glob.glob(f"{DST}/{sp}/{lb}/*"):
+        d = f"{DST}/{sp}/{lb}"
+        if not os.path.isdir(d):
+            continue
+        for f in glob.glob(f"{d}/*"):
             if Path(f).suffix.lower() in valid_ext:
                 names.append(os.path.basename(f))
 
@@ -289,7 +298,10 @@ print("[DUP-NAMES]", len(dup_names))
 seen, dups = {}, []
 for sp in ["train", "val", "test"]:
     for lb in ["real", "fake"]:
-        for p in Path(f"{DST}/{sp}/{lb}").glob("*"):
+        d = f"{DST}/{sp}/{lb}"
+        if not os.path.isdir(d):
+            continue
+        for p in Path(d).glob("*"):
             if p.suffix.lower() not in valid_ext:
                 continue
             h = md5sum(str(p))
@@ -297,16 +309,34 @@ for sp in ["train", "val", "test"]:
                 dups.append((str(p), seen[h]))
             else:
                 seen[h] = str(p)
+
 print("[DUP-CONTENT]", len(dups))
 if dups[:5]:
     print("[DUP-SAMPLE]", dups[:5])
 
-# 요약 출력
-df = pd.read_csv(FINAL_MANIFEST)
-print()
-print("[SUMMARY BY SPLIT/LABEL]")
-print(df.groupby(["split", "label"]).size().unstack(fill_value=0))
 
-print()
-print("[SUMMARY BY SPLIT/VARIANT]")
-print(df.groupby(["split", "variant"]).size().unstack(fill_value=0))
+import os
+from PIL import Image
+from pathlib import Path
+import glob
+
+SRC = "/content/drive/MyDrive/celeba_hq_binary"
+DST = "/content/drive/MyDrive/celeba_hq_binary_224_multi"
+
+for split in ["train", "val", "test"]:
+    for cls in ["real", "fake"]:
+        src_dir = f"{SRC}/{split}/{cls}"
+        dst_dir = f"{DST}/{split}/{cls}"
+        Path(dst_dir).mkdir(parents=True, exist_ok=True)
+
+        img_paths = glob.glob(f"{src_dir}/*")
+        print(f"[{split}/{cls}] {len(img_paths)}개 리사이즈 중...")
+
+        for p in img_paths:
+            try:
+                img = Image.open(p).convert("RGB")
+                img = img.resize((224, 224))
+                img.save(f"{dst_dir}/{Path(p).name}")
+            except:
+                print(f"[WARN] 실패: {p}")
+
